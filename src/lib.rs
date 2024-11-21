@@ -25,4 +25,6 @@ pub async fn run(db_uri: String) {
 
     // run our app with hyper, listening globally on port 3000
     axum::serve(listener, services).await.unwrap();
+
+    lyra_client::auth::get_auth_headers();
 }
