@@ -1,0 +1,3 @@
+[submodule "lib/cockpit"]
+	path = lib/cockpit
+	url = https://github.com/derivexyz/cockpit.git
