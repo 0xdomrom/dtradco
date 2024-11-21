@@ -10,6 +10,8 @@ edition = "2021"
 # Cockpit #
 ###########
 lyra-client = { git = "https://github.com/derivexyz/cockpit.git" }
+lyra-utils = { git = "https://github.com/derivexyz/cockpit.git" }
+orderbook-types = { git = "https://github.com/derivexyz/cockpit.git" }
 
 ############
 # External #
@@ -52,4 +54,7 @@ utoipa-swagger-ui ={ version = "6.0.0", features = ["axum"] }
 
 # ORM
 sea-orm = { version = "0.12.7", features = ["sqlx-postgres", "runtime-tokio-rustls"] }
+
+# General
 anyhow = "1.0.93"
+bigdecimal = { version = "0.4.6", features = [ "serde-json" ] }

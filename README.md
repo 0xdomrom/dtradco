@@ -32,7 +32,7 @@ rust-jwt-auth-boilerplate
 Clone Repository
 
 ```
-git clone https://github.com/felix1251/rust-jwt-auth-boilerplate.git <project-name>
+git clone https://github.com/0xdomrom/dtradco.git <project-name>
 cd <project-name>
 ```
 
