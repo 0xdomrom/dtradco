@@ -4,6 +4,7 @@ mod models;
 mod routes;
 mod swagger;
 mod utils;
+mod maker;
 
 pub async fn run(db_uri: String) {
     tracing_subscriber::fmt()
@@ -25,6 +26,4 @@ pub async fn run(db_uri: String) {
 
     // run our app with hyper, listening globally on port 3000
     axum::serve(listener, services).await.unwrap();
-
-    lyra_client::auth::get_auth_headers();
 }
