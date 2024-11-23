@@ -93,6 +93,9 @@ impl MarketData {
     pub fn get_tickers(&self) -> &HashMap<String, InstrumentTicker> {
         &self.tickers
     }
+    pub fn get_ticker_maybe_stale(&self, instrument_name: &str) -> Option<&InstrumentTicker> {
+        self.tickers.get(instrument_name)
+    }
     pub fn get_ticker(&self, instrument_name: &str) -> Option<&InstrumentTicker> {
         let ticker = self.tickers.get(instrument_name);
         let is_stale = ticker
