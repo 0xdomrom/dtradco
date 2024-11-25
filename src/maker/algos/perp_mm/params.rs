@@ -94,21 +94,27 @@ P(A, B, N - dN[total of prev levels] - dn/2[half size of this level], ask)
 
 */
 
-
-use bigdecimal::BigDecimal;
+use crate::maker::market::data::OrderbookData;
+use bigdecimal::{BigDecimal, One, RoundingMode, Zero};
+use orderbook_types::types::orders::Direction;
+use orderbook_types::types::tickers::InstrumentTicker;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PerpMMParams {
     pub subaccount_id: i64,
     pub instrument_name: String,
+
     // risk increasing params
     pub increasing_spread: BigDecimal,
     pub increasing_slippage: BigDecimal,
     /// when quoting risk increasing side and diming, this puts a cap/floor on the price
     pub min_spread_to_mid: BigDecimal,
+    /// when markets are super wide, we may want to quote tighter than the current spread
+    pub max_spread_to_mid: BigDecimal,
 
     // risk reducing params
+    /// typically negative spread to apply when reducing risk (negative -> bettering the market)
     pub reducing_spread: BigDecimal,
     pub reducing_slippage: BigDecimal,
     /// when quoting risk reducing side and diming, this prevents the price from crossing BBO
@@ -120,6 +126,5 @@ pub struct PerpMMParams {
     pub max_exposure: BigDecimal,
 
     /// dollar notionals to quote at each level excluding risk-reducing, e.g. [$3,000,  $27,000]
-    pub bid_notionals: Vec<BigDecimal>,
-    pub ask_notionals: Vec<BigDecimal>,
+    pub level_notionals: Vec<BigDecimal>,
 }

@@ -3,24 +3,24 @@ Defines core shared state of the market.
 Public and private modules define logic for ws subscriptions that update the shared state.
 */
 use bigdecimal::{BigDecimal, Zero};
-use tracing::info;
+use lyra_client::actions::{Direction, OrderStatus};
+use lyra_client::json_rpc::Notification;
+use orderbook_types::generated::channel_orderbook_instrument_name_group_depth::OrderbookInstrumentNameGroupDepthPublisherDataSchema;
+use orderbook_types::generated::channel_subaccount_id_balances::BalanceUpdateSchema;
+use orderbook_types::types::orders::{
+    GetTradesParams, GetTradesResponse, OrderNotificationData, OrderResponse,
+    TradeNotificationData, TradeResponse, TxStatus,
+};
+use orderbook_types::types::tickers::result::{InstrumentTicker, TickerNotificationData};
+use sea_orm::DeriveDisplay;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::hash::Hash;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tracing::info;
 use uuid::Uuid;
-use orderbook_types::generated::channel_subaccount_id_balances::BalanceUpdateSchema;
-use lyra_client::actions::{Direction, OrderStatus};
-use lyra_client::json_rpc::Notification;
-use orderbook_types::types::orders::{
-    GetTradesParams, GetTradesResponse, OrderNotificationData, OrderResponse,
-    TradeNotificationData, TxStatus, TradeResponse
-};
-use orderbook_types::generated::channel_orderbook_instrument_name_group_depth::OrderbookInstrumentNameGroupDepthPublisherDataSchema;
-use orderbook_types::types::tickers::result::{InstrumentTicker, TickerNotificationData};
-use sea_orm::DeriveDisplay;
 
 pub type OrderbookData = OrderbookInstrumentNameGroupDepthPublisherDataSchema;
 
@@ -30,7 +30,6 @@ pub enum MarketSubscriberData {
     OrderbookMsg(Notification<OrderbookData>),
     TickerMsg(Notification<TickerNotificationData>),
 }
-
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(untagged)]
@@ -77,15 +76,17 @@ impl MarketData {
     }
     pub fn get_orderbook(&self, instrument_name: &str) -> Option<&OrderbookData> {
         let orderbook = self.orderbooks.get(instrument_name);
-        let is_stale = orderbook
-            .map_or(true, |o| chrono::Utc::now().timestamp_millis() - o.timestamp > STALENESS_MS);
+        let is_stale = orderbook.map_or(true, |o| {
+            chrono::Utc::now().timestamp_millis() - o.timestamp > STALENESS_MS
+        });
         match is_stale {
             true => None,
             false => orderbook,
         }
     }
     pub fn insert_orderbook(&mut self, orderbook: OrderbookData) {
-        self.orderbooks.insert(orderbook.instrument_name.clone(), orderbook);
+        self.orderbooks
+            .insert(orderbook.instrument_name.clone(), orderbook);
     }
     pub fn iter_orderbooks(&self) -> impl Iterator<Item = &OrderbookData> {
         self.orderbooks.values()
@@ -98,8 +99,9 @@ impl MarketData {
     }
     pub fn get_ticker(&self, instrument_name: &str) -> Option<&InstrumentTicker> {
         let ticker = self.tickers.get(instrument_name);
-        let is_stale = ticker
-            .map_or(true, |t| chrono::Utc::now().timestamp_millis() - t.timestamp > STALENESS_MS);
+        let is_stale = ticker.map_or(true, |t| {
+            chrono::Utc::now().timestamp_millis() - t.timestamp > STALENESS_MS
+        });
         match is_stale {
             true => None,
             false => ticker,
@@ -115,10 +117,13 @@ impl MarketData {
         self.positions.get(instrument_name)
     }
     pub fn get_amount(&self, instrument_name: &str) -> BigDecimal {
-        self.positions.get(instrument_name).map_or(BigDecimal::zero(), |p| p.amount.clone())
+        self.positions
+            .get(instrument_name)
+            .map_or(BigDecimal::zero(), |p| p.amount.clone())
     }
     pub fn insert_position(&mut self, position: Balance) {
-        self.positions.insert(position.instrument_name.clone(), position);
+        self.positions
+            .insert(position.instrument_name.clone(), position);
     }
     pub fn iter_positions(&self) -> impl Iterator<Item = &Balance> {
         self.positions.values()
@@ -127,7 +132,10 @@ impl MarketData {
         self.orders.get(instrument_name)
     }
     pub fn insert_order(&mut self, order: OrderResponse) {
-        let orders = self.orders.entry(order.instrument_name.clone()).or_default();
+        let orders = self
+            .orders
+            .entry(order.instrument_name.clone())
+            .or_default();
         let order_id = order.order_id.clone();
         let existing = orders.remove(&order_id);
         if let Some(existing) = existing {
@@ -179,7 +187,10 @@ impl MarketData {
         self.trades.get(instrument_name)
     }
     pub fn insert_trade(&mut self, trade: TradeResponse) {
-        let trades = self.trades.entry(trade.instrument_name.clone()).or_default();
+        let trades = self
+            .trades
+            .entry(trade.instrument_name.clone())
+            .or_default();
         trades.insert(trade.trade_id.clone(), trade);
     }
     pub fn all_trades_confirmed(&self, instrument_name: &str) -> bool {

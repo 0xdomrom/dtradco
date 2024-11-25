@@ -1,11 +1,15 @@
-use tracing::log::{error, info};
-use anyhow::{Result,Error};
-use chrono::Utc;
-use lyra_client::json_rpc::{WsClient, WsClientExt, Response, http_rpc};
 use crate::maker::market;
-use crate::maker::market::data::{MarketState, MarketSubscriberData, SubaccountSubscriberData, Balance};
-use orderbook_types::generated::private_get_subaccount::{PrivateGetSubaccountResponseSchema, PrivateGetSubaccountParamsSchema};
+use crate::maker::market::data::{
+    Balance, MarketState, MarketSubscriberData, SubaccountSubscriberData,
+};
+use anyhow::{Error, Result};
+use chrono::Utc;
+use lyra_client::json_rpc::{http_rpc, Response, WsClient, WsClientExt};
+use orderbook_types::generated::private_get_subaccount::{
+    PrivateGetSubaccountParamsSchema, PrivateGetSubaccountResponseSchema,
+};
 use serde_json::Value;
+use tracing::log::{error, info};
 
 pub async fn subscribe_market(state: MarketState, instrument_names: Vec<&str>) -> Result<()> {
     info!("Starting market subscriber task");
@@ -27,7 +31,10 @@ pub async fn subscribe_market(state: MarketState, instrument_names: Vec<&str>) -
                     state.write().await.insert_orderbook(msg.params.data);
                 }
                 MarketSubscriberData::TickerMsg(msg) => {
-                    state.write().await.insert_ticker(msg.params.data.instrument_ticker);
+                    state
+                        .write()
+                        .await
+                        .insert_ticker(msg.params.data.instrument_ticker);
                 }
             }
             Ok(())
@@ -35,7 +42,6 @@ pub async fn subscribe_market(state: MarketState, instrument_names: Vec<&str>) -
         .await?;
     Ok(())
 }
-
 
 /// Syncs the subaccount state with the market struct
 /// This includes balances, orders and recent trade history (to check for non-settled trades)
@@ -50,7 +56,7 @@ pub async fn sync_subaccount(
         PrivateGetSubaccountParamsSchema { subaccount_id },
         Some(headers.clone()),
     )
-        .await?;
+    .await?;
     info!("Subaccount state fetched");
     let mut writer = market.write().await;
     match subacc {
@@ -98,11 +104,12 @@ pub async fn sync_subaccount(
             },
             Some(headers.clone()),
         )
-            .await?;
+        .await?;
         info!("Trades");
         info!("{:?}", trades);
         if let Response::Success(trades) = trades {
-            let trades = serde_json::from_value::<orderbook_types::types::orders::GetTradesResponse>(trades);
+            let trades =
+                serde_json::from_value::<orderbook_types::types::orders::GetTradesResponse>(trades);
             if let Ok(trades) = trades {
                 for trade in trades.result.trades {
                     writer.insert_trade(trade);
