@@ -1,0 +1,42 @@
+[
+  {
+    "subaccount_id": 103808,
+    "instrument_name": "BTC-PERP",
+    "increasing_spread": "-0.00003",
+    "increasing_slippage": "0.0003",
+    "reducing_spread": "-0.00003",
+    "reducing_slippage": "0.0003",
+    "max_spread_to_mid": "0.01",
+    "min_spread_to_mid": "0.00005",
+    "min_spread_to_best": "0.00002",
+    "warn_exposure": "2000",
+    "max_exposure": "6000",
+    "level_notionals": [
+      "1500",
+      "3000"
+    ],
+    "max_tps": 10,
+    "price_replace_tol": "0.00003",
+    "amount_replace_tol": "0.05"
+  },
+  {
+    "subaccount_id": 103808,
+    "instrument_name": "ETH-PERP",
+    "increasing_spread": "-0.00003",
+    "increasing_slippage": "0.0003",
+    "reducing_spread": "-0.00003",
+    "reducing_slippage": "0.0003",
+    "max_spread_to_mid": "0.01",
+    "min_spread_to_mid": "0.00005",
+    "min_spread_to_best": "0.00002",
+    "warn_exposure": "2000",
+    "max_exposure": "6000",
+    "level_notionals": [
+      "1500",
+      "3000"
+    ],
+    "max_tps": 10,
+    "price_replace_tol": "0.00003",
+    "amount_replace_tol": "0.05"
+  }
+]

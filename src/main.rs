@@ -1,16 +1,21 @@
 mod maker;
 
+use crate::maker::algos::perp_mm::{new_params_ref, PerpMM, PerpMMParams, PerpMMParamsRef};
+use crate::maker::market;
+use crate::maker::market::data::new_market_state;
+use crate::maker::market::tasks::{subscribe_market, subscribe_subaccount, sync_subaccount};
+use anyhow::{Error, Result};
+use bigdecimal::BigDecimal;
 use dotenvy::dotenv;
 use dotenvy_macro::dotenv;
 use dtradco::run;
 use lyra_client::json_rpc::WsClientExt;
-use anyhow::Result;
 use lyra_client::setup::ensure_env;
 use serde_json::{json, Value};
+use std::str::FromStr;
+use std::sync::Arc;
+use tokio::task::JoinSet;
 use tracing::log::info;
-use crate::maker::market;
-use crate::maker::market::data::new_market_state;
-use crate::maker::market::tasks::{subscribe_market, subscribe_subaccount, sync_subaccount};
 
 pub async fn setup_env() {
     dotenvy::from_filename(".env").expect("Failed to load .env file");
@@ -29,24 +34,51 @@ pub async fn setup_env() {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()>  {
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
+async fn main() -> Result<()> {
     // let db_uri = format!("{}", dotenv!("DATABASE_URL"));
     // run(db_uri).await;
     setup_env().await;
-    let market = new_market_state();
-    let client = lyra_client::json_rpc::WsClient::new_client().await?;
-    client.login().await?.into_result()?;
-    // let client = lyra_client::json_rpc::WsClient::new_client().await?;
-    // let time_res = client.send_rpc::<Value, Value>("public/get_time", json!({})).await?;
-    // tracing::info!("Time: {:?}", time_res);
-    // sleep for 3 sec
 
-    let subacc_id = 103410;
-    sync_subaccount(market.clone(), subacc_id, vec!["ETH-PERP".to_string()]).await?;
-    tokio::spawn(subscribe_subaccount(market.clone(), subacc_id));
-    // tokio::spawn(subscribe_market(market.clone(), vec!["ETH-PERP"]));
-    tokio::spawn(market::tasks::log_state(market.clone()));
-    tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+    let args: Vec<String> = std::env::args().collect();
+    let json_name = args.get(1).ok_or(Error::msg("No json name provided"))?;
+    let params = tokio::fs::read_to_string(format!("./params/{json_name}.json")).await?;
+    let params: Vec<PerpMMParams> = serde_json::from_str(&params)?;
+
+    let params_refs = params
+        .into_iter()
+        .map(|p| new_params_ref(p))
+        .collect::<Vec<PerpMMParamsRef>>();
+
+    let client = PerpMM::new_client().await?;
+    let market = PerpMM::new_market().await;
+
+    let perp_mms: Vec<Arc<PerpMM>> = params_refs
+        .into_iter()
+        .map(|params_ref| {
+            Arc::new(PerpMM::new_from_state(
+                params_ref,
+                market.clone(),
+                client.clone(),
+            ))
+        })
+        .collect();
+
+    let mut join_set = JoinSet::new();
+
+    for i in 0..perp_mms.len() {
+        let perp_mm = Arc::clone(&perp_mms[i]);
+        join_set.spawn(async move {
+            let res = perp_mm.run().await;
+            if let Err(ref e) = res {
+                tracing::error!("Perp MM failed: {:?}", e);
+            }
+            // todo clean restart
+            panic!("Perp MM failed: {:?}", res);
+        });
+    }
+
+    join_set.join_all().await;
+
     Ok(())
 }

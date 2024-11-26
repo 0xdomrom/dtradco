@@ -93,12 +93,10 @@ P(A, B, N + dN[total of prev levels] + dn/2[half size of this level], bid)
 P(A, B, N - dN[total of prev levels] - dn/2[half size of this level], ask)
 
 */
-
-use crate::maker::market::data::OrderbookData;
-use bigdecimal::{BigDecimal, One, RoundingMode, Zero};
-use orderbook_types::types::orders::Direction;
-use orderbook_types::types::tickers::InstrumentTicker;
+use bigdecimal::BigDecimal;
 use serde::Deserialize;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PerpMMParams {
@@ -127,4 +125,14 @@ pub struct PerpMMParams {
 
     /// dollar notionals to quote at each level excluding risk-reducing, e.g. [$3,000,  $27,000]
     pub level_notionals: Vec<BigDecimal>,
+
+    pub max_tps: u64,
+    pub price_replace_tol: BigDecimal,  // bps of limit price
+    pub amount_replace_tol: BigDecimal, // bps of limit amount
+}
+
+pub type PerpMMParamsRef = Arc<RwLock<PerpMMParams>>;
+
+pub fn new_params_ref(params: PerpMMParams) -> PerpMMParamsRef {
+    Arc::new(RwLock::new(params))
 }

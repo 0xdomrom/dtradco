@@ -162,7 +162,7 @@ impl MarketData {
         if orders.is_none() {
             return Some(ob);
         }
-        let orders = orders.unwrap();
+        let orders = orders?;
         for order in orders.values() {
             let bids_or_asks = match order.direction {
                 Direction::Buy => &mut ob.bids,
@@ -200,6 +200,33 @@ impl MarketData {
                 .values()
                 .all(|t| t.tx_status == TxStatus::Settled || t.tx_status == TxStatus::Reverted),
             None => true,
+        }
+    }
+    pub fn get_open_orders_summary(
+        &self,
+        instrument_name: &str,
+        direction: Direction,
+    ) -> Vec<(String, BigDecimal, BigDecimal)> {
+        if let Some(orders) = self.get_orders(instrument_name) {
+            let mut summary: Vec<(String, BigDecimal, BigDecimal)> = orders
+                .values()
+                .filter(|o| o.direction == direction)
+                .map(|o| {
+                    (
+                        o.order_id.clone(),
+                        o.limit_price.clone(),
+                        o.amount.clone() - &o.filled_amount,
+                    )
+                })
+                .collect();
+            if direction == Direction::Buy {
+                summary.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            } else {
+                summary.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            }
+            summary
+        } else {
+            Vec::new()
         }
     }
     pub fn log_state(&self) {
