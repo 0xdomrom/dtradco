@@ -3125,7 +3125,7 @@ checksum = "a7a70ba024b9dc04c27ea2f0c0548feb474ec5c54bba33a7f72f873a39d07b24"
 [[package]]
 name = "lyra-client"
 version = "0.1.0"
-source = "git+https://github.com/derivexyz/cockpit.git#62cf67536190069109e44b82a822c8148840cca1"
+source = "git+https://github.com/derivexyz/cockpit.git#6a936e5c5e625c363a3d8de1759a083eee4cdea3"
 dependencies = [
  "anyhow",
  "aws-secrets",
@@ -3153,7 +3153,7 @@ dependencies = [
 [[package]]
 name = "lyra-utils"
 version = "0.1.0"
-source = "git+https://github.com/derivexyz/cockpit.git#62cf67536190069109e44b82a822c8148840cca1"
+source = "git+https://github.com/derivexyz/cockpit.git#6a936e5c5e625c363a3d8de1759a083eee4cdea3"
 dependencies = [
  "anyhow",
  "bigdecimal 0.4.6",
@@ -3550,7 +3550,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 [[package]]
 name = "orderbook-types"
 version = "0.0.1"
-source = "git+https://github.com/derivexyz/cockpit.git#62cf67536190069109e44b82a822c8148840cca1"
+source = "git+https://github.com/derivexyz/cockpit.git#6a936e5c5e625c363a3d8de1759a083eee4cdea3"
 dependencies = [
  "automod",
  "bigdecimal 0.4.6",
@@ -4366,9 +4366,9 @@ dependencies = [
 
 [[package]]
 name = "rsa"
-version = "0.9.6"
+version = "0.9.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d0e5124fcb30e76a7e79bfee683a2746db83784b86289f6251b54b7950a0dfc"
+checksum = "47c75d7c5c6b673e58bf54d8544a9f432e3a925b0e80f7cd3602ab5c50c55519"
 dependencies = [
  "const-oid",
  "digest 0.10.7",

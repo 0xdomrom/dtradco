@@ -38,10 +38,23 @@ pub async fn setup_env() {
 async fn main() -> Result<()> {
     // let db_uri = format!("{}", dotenv!("DATABASE_URL"));
     // run(db_uri).await;
-    setup_env().await;
 
     let args: Vec<String> = std::env::args().collect();
     let json_name = args.get(1).ok_or(Error::msg("No json name provided"))?;
+    let env_name: &String = args.get(2).ok_or(Error::msg("No env name provided"))?;
+    let sk_name = args.get(3);
+
+    std::env::set_var("ENV", env_name.clone());
+    if let Some(sk_name) = sk_name {
+        std::env::set_var("SESSION_KEY_NAME", sk_name.clone());
+        std::env::set_var("OWNER_KEY_NAME", sk_name.clone());
+    }
+
+    setup_env().await;
+    lyra_client::setup::ensure_session_key().await;
+    lyra_client::setup::ensure_owner().await;
+    lyra_client::setup::setup_ws_endpoint().await;
+
     let params = tokio::fs::read_to_string(format!("./params/{json_name}.json")).await?;
     let params: Vec<PerpMMParams> = serde_json::from_str(&params)?;
 

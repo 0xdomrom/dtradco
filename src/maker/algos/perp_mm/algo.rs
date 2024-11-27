@@ -372,26 +372,47 @@ impl PerpMM {
         Ok(())
     }
 
-    async fn get_interval(&self) -> Duration {
+    async fn get_tps(&self) -> u64 {
         let params = self.params.read().await;
-        let num_levels = (1 + params.level_notionals.len() * 2) as u64;
-        let interval_ms: u64 = num_levels * 1000 / (params.max_tps);
-        Duration::from_millis(interval_ms)
+        params.max_tps
     }
 
     pub async fn run_maker(&self) -> Result<()> {
-        let mut interval = tokio::time::interval(self.get_interval().await);
+        let max_tps = self.get_tps().await;
         self.market_ready().await?;
+
+        let mut base_wait_time = tokio::time::interval(Duration::from_millis(1));
+        let mut last_publish_id = 0;
+        let mut tps_left: i64 = max_tps as i64;
+        let mut last_refill_us = chrono::Utc::now().timestamp_micros();
         loop {
-            interval.tick().await;
+            base_wait_time.tick().await;
+
+            let now_us = chrono::Utc::now().timestamp_micros();
+            let elapsed_since_last_refill = now_us - last_refill_us;
+            if elapsed_since_last_refill > 1_000_000 {
+                tps_left = max_tps as i64;
+                last_refill_us = now_us;
+            }
+            if tps_left <= 0 {
+                continue;
+            }
+
             let params = self.params.read().await;
             let market = self.market.read().await;
-            let ticker = market
-                .get_ticker(&params.instrument_name)
-                .ok_or(Error::msg("Ticker not found"))?;
             let orderbook = market
                 .get_orderbook_exclude_my_orders(&params.instrument_name)
                 .ok_or(Error::msg("Orderbook not found"))?;
+
+            if orderbook.publish_id == last_publish_id {
+                continue;
+            } else {
+                last_publish_id = orderbook.publish_id;
+            }
+
+            let ticker = market
+                .get_ticker(&params.instrument_name)
+                .ok_or(Error::msg("Ticker not found"))?;
             let balance = market.get_amount(&params.instrument_name);
 
             let state = {
@@ -444,15 +465,22 @@ impl PerpMM {
 
             drop(params);
 
-            // tracing::warn!("Desired bids: {:?}", desired_bids);
-            // tracing::warn!("Desired asks: {:?}", desired_asks);
-
             let bid_exec =
                 self.execute_desired(&state, Direction::Buy, &desired_bids, &state.open_bids);
             let ask_exec =
                 self.execute_desired(&state, Direction::Sell, &desired_asks, &state.open_asks);
 
             let res = tokio::join!(bid_exec, ask_exec);
+
+            tps_left -= (desired_bids.len() + desired_asks.len() + 1) as i64;
+            if tps_left <= 1 {
+                tracing::warn!("TPS limit reached, waiting for refill");
+                tps_left -= 1;
+                self.client
+                    .cancel_by_instrument(state.subaccount_id, state.ticker.instrument_name.clone())
+                    .await?
+                    .into_result()?;
+            }
         }
     }
 
