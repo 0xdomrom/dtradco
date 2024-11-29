@@ -2,7 +2,9 @@
 Defines core shared state of the market.
 Public and private modules define logic for ws subscriptions that update the shared state.
 */
-use bigdecimal::{BigDecimal, Zero};
+use crate::maker::market::external::binance::CombinedBookTickerData;
+use bigdecimal::{BigDecimal, FromPrimitive, One, Zero};
+use chrono::Utc;
 use lyra_client::actions::{Direction, OrderStatus};
 use lyra_client::json_rpc::Notification;
 use orderbook_types::generated::channel_orderbook_instrument_name_group_depth::OrderbookInstrumentNameGroupDepthPublisherDataSchema;
@@ -46,6 +48,42 @@ pub struct Balance {
     pub timestamp: i64,
 }
 
+#[derive(Clone, Debug)]
+pub struct ExternalOrderbook {
+    pub symbol: String,
+    pub best_bid_price: BigDecimal,
+    pub best_ask_price: BigDecimal,
+    pub recv_timestamp: i64,
+    pub send_timestamp: i64,
+    pub basis: BigDecimal,
+}
+
+impl ExternalOrderbook {
+    pub fn from_tickers(data: CombinedBookTickerData, basis: BigDecimal) -> Self {
+        ExternalOrderbook {
+            symbol: data.data.symbol,
+            best_bid_price: data.data.best_bid_price,
+            best_ask_price: data.data.best_ask_price,
+            recv_timestamp: Utc::now().timestamp_millis(),
+            send_timestamp: data.data.event_time,
+            basis,
+        }
+    }
+    pub fn is_different(&self, other: &ExternalOrderbook, replace_tol: &BigDecimal) -> bool {
+        let this_mid: BigDecimal = self.mid_price();
+        let other_mid: BigDecimal = other.mid_price();
+        // magnify diff by 2 since we want to be more reactive than the replace tolerance
+        let diff = 2 * (&this_mid - &other_mid).abs() / &other_mid;
+        &diff > replace_tol
+    }
+    pub fn mid_price(&self) -> BigDecimal {
+        (&self.best_bid_price + &self.best_ask_price) / 2
+    }
+    pub fn mid_price_with_basis(&self) -> BigDecimal {
+        &self.mid_price() * &self.basis
+    }
+}
+
 impl Display for Balance {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}: {}", self.instrument_name, self.amount)
@@ -60,9 +98,13 @@ pub struct MarketData {
     positions: HashMap<String, Balance>,
     orders: HashMap<String, HashMap<String, OrderResponse>>,
     trades: HashMap<String, HashMap<String, TradeResponse>>,
+    external_orderbooks: HashMap<String, ExternalOrderbook>,
+    internal_to_external_symbol: HashMap<String, String>,
+    external_basis: HashMap<String, (BigDecimal, i64)>,
 }
 
 const STALENESS_MS: i64 = 2_000; // todo ideally want to log the staleness
+const BASIS_DECAY_RATE: f64 = 0.00006931471; // -ln(0.5) / 10000, i.e. half life of 10 seconds
 
 impl MarketData {
     pub fn new() -> Self {
@@ -72,21 +114,89 @@ impl MarketData {
             positions: HashMap::new(),
             orders: HashMap::new(),
             trades: HashMap::new(),
+            external_orderbooks: HashMap::new(),
+            internal_to_external_symbol: HashMap::new(),
+            external_basis: HashMap::new(),
         }
     }
     pub fn get_orderbook(&self, instrument_name: &str) -> Option<&OrderbookData> {
         let orderbook = self.orderbooks.get(instrument_name);
         let is_stale = orderbook.map_or(true, |o| {
-            chrono::Utc::now().timestamp_millis() - o.timestamp > STALENESS_MS
+            Utc::now().timestamp_millis() - o.timestamp > STALENESS_MS
         });
         match is_stale {
             true => None,
             false => orderbook,
         }
     }
+    pub fn get_external_basis(&self, instrument_name: &str) -> BigDecimal {
+        self.external_basis
+            .get(instrument_name)
+            .map_or(BigDecimal::one(), |(basis, _)| basis.clone())
+    }
+    pub fn update_basis(&mut self, symbol: &str, basis: BigDecimal) {
+        let basis_now = self.external_basis.get(symbol);
+        let ts_now = Utc::now().timestamp_millis();
+        let (basis_now, ts) = match basis_now {
+            Some((prev_basis, prev_ts)) => {
+                let dt = (ts_now - prev_ts) as f64;
+                let decay = (-dt * BASIS_DECAY_RATE).exp();
+                let decay = BigDecimal::from_f64(decay).unwrap();
+                let new_basis = prev_basis * &decay + basis * (1 - &decay);
+                (new_basis, ts_now)
+            }
+            None => (basis, ts_now),
+        };
+        self.external_basis
+            .insert(symbol.to_string(), (basis_now.round(18), ts));
+    }
     pub fn insert_orderbook(&mut self, orderbook: OrderbookData) {
+        let instrument_name = orderbook.instrument_name.clone();
         self.orderbooks
             .insert(orderbook.instrument_name.clone(), orderbook);
+        // if an external orderbook exists for this symbol, calibrate the basis
+        if let Some(extern_ob) = self.get_external_orderbook(&instrument_name) {
+            let extern_mid = extern_ob.mid_price();
+            let ob = self.get_orderbook(&instrument_name).unwrap();
+            let best_bid = ob.bids.first();
+            let best_ask = ob.asks.first();
+            if let (Some(best_bid), Some(best_ask)) = (best_bid, best_ask) {
+                let mid: BigDecimal = (&best_bid[0] + &best_ask[0]) / 2;
+                let basis = &mid / &extern_mid;
+                let symbol = self
+                    .internal_to_external_symbol
+                    .get(&instrument_name)
+                    .expect(format!("No external symbol for {}", instrument_name).as_str())
+                    .clone();
+                self.update_basis(&symbol, basis);
+            }
+        }
+    }
+    pub fn add_external_symbol(&mut self, symbol: String, instrument_name: String) {
+        self.internal_to_external_symbol
+            .insert(instrument_name, symbol);
+    }
+    pub fn get_external_orderbook(&self, instrument_name: &str) -> Option<&ExternalOrderbook> {
+        let symbol_name = self
+            .internal_to_external_symbol
+            .get(instrument_name)
+            .expect(format!("No external symbol for {}", instrument_name).as_str());
+        let orderbook = self.external_orderbooks.get(symbol_name);
+        let is_stale = orderbook.map_or(true, |o| {
+            chrono::Utc::now().timestamp_millis() - o.recv_timestamp > STALENESS_MS
+        });
+        match is_stale {
+            true => None,
+            false => orderbook,
+        }
+    }
+    pub fn insert_external_orderbook(&mut self, orderbook: ExternalOrderbook) {
+        if orderbook.recv_timestamp % 20 == 0 {
+            let latency = orderbook.recv_timestamp - orderbook.send_timestamp;
+            info!("Received external orderbook with latency: {} ms", latency);
+        }
+        self.external_orderbooks
+            .insert(orderbook.symbol.clone(), orderbook);
     }
     pub fn iter_orderbooks(&self) -> impl Iterator<Item = &OrderbookData> {
         self.orderbooks.values()

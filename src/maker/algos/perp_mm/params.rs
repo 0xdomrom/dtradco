@@ -102,22 +102,21 @@ use tokio::sync::RwLock;
 pub struct PerpMMParams {
     pub subaccount_id: i64,
     pub instrument_name: String,
+    pub external_symbol: String,
 
     // risk increasing params
     pub increasing_spread: BigDecimal,
     pub increasing_slippage: BigDecimal,
-    /// when quoting risk increasing side and diming, this puts a cap/floor on the price
-    pub min_spread_to_mid: BigDecimal,
-    /// when markets are super wide, we may want to quote tighter than the current spread
-    pub max_spread_to_mid: BigDecimal,
+    pub increasing_min_edge: BigDecimal,
 
     // risk reducing params
     /// typically negative spread to apply when reducing risk (negative -> bettering the market)
     pub reducing_spread: BigDecimal,
     pub reducing_slippage: BigDecimal,
-    /// when quoting risk reducing side and diming, this prevents the price from crossing BBO
-    pub min_spread_to_best: BigDecimal,
+    pub reducing_min_edge: BigDecimal,
 
+    /// when markets are super wide, we may want to quote tighter than the current spread
+    pub max_edge: BigDecimal,
     /// above this, the quoted size will decay linearly to 0 as it approaches max_exposure
     pub warn_exposure: BigDecimal,
     /// at or > this, the quoted size is 0

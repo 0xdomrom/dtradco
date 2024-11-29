@@ -3,7 +3,9 @@ mod maker;
 use crate::maker::algos::perp_mm::{new_params_ref, PerpMM, PerpMMParams, PerpMMParamsRef};
 use crate::maker::market;
 use crate::maker::market::data::new_market_state;
-use crate::maker::market::tasks::{subscribe_market, subscribe_subaccount, sync_subaccount};
+use crate::maker::market::tasks::{
+    add_external_instrument, subscribe_market, subscribe_subaccount, sync_subaccount,
+};
 use anyhow::{Error, Result};
 use bigdecimal::BigDecimal;
 use dotenvy::dotenv;
@@ -57,24 +59,38 @@ async fn main() -> Result<()> {
 
     let params = tokio::fs::read_to_string(format!("./params/{json_name}.json")).await?;
     let params: Vec<PerpMMParams> = serde_json::from_str(&params)?;
-    let subaccs_instruments = params
+    let subaccs = params.iter().map(|p| p.subaccount_id).collect::<Vec<i64>>();
+    let instruments = params
         .iter()
-        .map(|p| (p.subaccount_id, p.instrument_name.clone()))
-        .collect::<Vec<(i64, String)>>();
+        .map(|p| p.instrument_name.clone())
+        .collect::<Vec<String>>();
+
+    if !subaccs.iter().all(|&s| s == subaccs[0]) {
+        panic!("All subaccounts in the params array must be the same");
+    }
+    let subaccount_id = subaccs[0];
+
+    let symbols: Vec<String> = params.iter().map(|p| p.external_symbol.clone()).collect();
+
+    let client = PerpMM::new_client().await?;
+    let market = PerpMM::new_market().await;
+
+    for p in params.iter() {
+        let mkt = market.clone();
+        add_external_instrument(mkt, p.external_symbol.clone(), p.instrument_name.clone()).await;
+    }
 
     let params_refs = params
         .into_iter()
         .map(|p| new_params_ref(p))
         .collect::<Vec<PerpMMParamsRef>>();
 
-    let client = PerpMM::new_client().await?;
-    let market = PerpMM::new_market().await;
-
     let perp_mms: Vec<Arc<PerpMM>> = params_refs
         .into_iter()
         .enumerate()
         .map(|(i, params_ref)| {
-            let (subacc, instr) = &subaccs_instruments[i];
+            let subacc = subaccs[i];
+            let instr = instruments[i].clone();
             Arc::new(PerpMM::new_from_state(
                 params_ref,
                 market.clone(),
@@ -86,6 +102,15 @@ async fn main() -> Result<()> {
         .collect();
 
     let mut join_set = JoinSet::new();
+
+    let mkt_clone = market.clone();
+    let market_handle = tokio::spawn(async move {
+        PerpMM::run_market(mkt_clone, subaccount_id, instruments.clone()).await
+    });
+    let external_handle =
+        tokio::spawn(
+            async move { market::tasks::subscribe_external(market.clone(), symbols).await },
+        );
 
     for i in 0..perp_mms.len() {
         let perp_mm = Arc::clone(&perp_mms[i]);
@@ -99,7 +124,19 @@ async fn main() -> Result<()> {
         });
     }
 
-    join_set.join_all().await;
+    let mms_handle = join_set.join_all();
+
+    tokio::select! {
+        _ = mms_handle => {
+            tracing::error!("Perp MM failed");
+        }
+        _ = market_handle => {
+            tracing::error!("Market failed");
+        }
+        _ = external_handle => {
+            tracing::error!("External failed");
+        }
+    }
 
     Ok(())
 }

@@ -2,13 +2,14 @@
   {
     "subaccount_id": 103808,
     "instrument_name": "BTC-PERP",
+    "external_symbol": "BTCUSD_PERP",
     "increasing_spread": "-0.00003",
     "increasing_slippage": "0.0003",
+    "increasing_min_edge": "0.0001",
     "reducing_spread": "-0.00003",
     "reducing_slippage": "0.0003",
-    "max_spread_to_mid": "0.01",
-    "min_spread_to_mid": "0.00005",
-    "min_spread_to_best": "0.00002",
+    "reducing_min_edge": "-0.00005",
+    "max_edge": "0.01",
     "warn_exposure": "2000",
     "max_exposure": "6000",
     "level_notionals": [

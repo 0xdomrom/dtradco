@@ -1,8 +1,10 @@
 use crate::maker::market;
 use crate::maker::market::data::{
-    Balance, MarketState, MarketSubscriberData, SubaccountSubscriberData,
+    Balance, ExternalOrderbook, MarketState, MarketSubscriberData, SubaccountSubscriberData,
 };
+use crate::maker::market::external::binance::{get_binance_stream_url, CombinedBookTickerData};
 use anyhow::{Error, Result};
+use bigdecimal::BigDecimal;
 use chrono::Utc;
 use lyra_client::json_rpc::{http_rpc, Response, WsClient, WsClientExt};
 use orderbook_types::generated::private_get_subaccount::{
@@ -11,7 +13,7 @@ use orderbook_types::generated::private_get_subaccount::{
 use serde_json::Value;
 use tracing::log::{error, info};
 
-pub async fn subscribe_market(state: MarketState, instrument_names: Vec<&str>) -> Result<()> {
+pub async fn subscribe_market(state: MarketState, instrument_names: Vec<String>) -> Result<()> {
     info!("Starting market subscriber task");
     let channels: Vec<String> = instrument_names
         .iter()
@@ -127,7 +129,7 @@ pub async fn sync_subaccount(
     Ok(())
 }
 
-pub async fn subscribe_subaccount(state: MarketState, subaccount_id: i64) -> Result<()> {
+pub async fn subscribe_subaccount(market: MarketState, subaccount_id: i64) -> Result<()> {
     let channels: Vec<String> = vec![
         format!("{}.balances", subaccount_id),
         format!("{}.orders", subaccount_id),
@@ -144,7 +146,7 @@ pub async fn subscribe_subaccount(state: MarketState, subaccount_id: i64) -> Res
         .subscribe(channels, |d: SubaccountSubscriberData| async {
             match d {
                 SubaccountSubscriberData::BalancesMsg(msg) => {
-                    let mut writer = state.write().await;
+                    let mut writer = market.write().await;
                     for balance in msg.params.data {
                         writer.insert_position(Balance {
                             instrument_name: balance.name.clone(),
@@ -154,13 +156,13 @@ pub async fn subscribe_subaccount(state: MarketState, subaccount_id: i64) -> Res
                     }
                 }
                 SubaccountSubscriberData::OrdersMsg(msg) => {
-                    let mut writer = state.write().await;
+                    let mut writer = market.write().await;
                     for order in msg.params.data {
                         writer.insert_order(order);
                     }
                 }
                 SubaccountSubscriberData::TradesMsg(msg) => {
-                    let mut writer = state.write().await;
+                    let mut writer = market.write().await;
                     for trade in msg.params.data {
                         writer.insert_trade(trade);
                     }
@@ -178,4 +180,21 @@ pub async fn log_state(market: MarketState) {
         market.read().await.log_state();
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
     }
+}
+
+pub async fn add_external_instrument(market: MarketState, symbol: String, instrument_name: String) {
+    let mut writer = market.write().await;
+    writer.add_external_symbol(symbol, instrument_name);
+}
+
+pub async fn subscribe_external(market: MarketState, symbols: Vec<String>) -> Result<()> {
+    let stream_url = get_binance_stream_url(symbols);
+    market::external::binance::subscribe(&stream_url, |d: CombinedBookTickerData| async {
+        let mut writer = market.write().await;
+        let symbol = d.data.symbol.clone();
+        let basis = writer.get_external_basis(&symbol);
+        writer.insert_external_orderbook(ExternalOrderbook::from_tickers(d, basis));
+        Ok(())
+    })
+    .await
 }

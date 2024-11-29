@@ -1,5 +1,7 @@
 use crate::maker::algos::perp_mm::{PerpMMParams, PerpMMParamsRef};
-use crate::maker::market::data::{new_market_state, MarketState, OpenOrderSummary, OrderbookData};
+use crate::maker::market::data::{
+    new_market_state, ExternalOrderbook, MarketState, OpenOrderSummary, OrderbookData,
+};
 use crate::maker::market::tasks::{subscribe_market, subscribe_subaccount, sync_subaccount};
 use anyhow::{Error, Result};
 use bigdecimal::{BigDecimal, One, RoundingMode, Zero};
@@ -36,8 +38,8 @@ impl PerpMMParams {
             None => mark,
         };
 
-        let best_bid_est = best_bid_max * (&one - &self.max_spread_to_mid);
-        let best_ask_est = best_ask_min * (&one + &self.max_spread_to_mid);
+        let best_bid_est = best_bid_max * (&one - &self.max_edge);
+        let best_ask_est = best_ask_min * (&one + &self.max_edge);
 
         let best_bid = best_bid.unwrap_or(best_bid_est.clone()).max(best_bid_est);
         let best_ask = best_ask.unwrap_or(best_ask_est.clone()).min(best_ask_est);
@@ -45,16 +47,56 @@ impl PerpMMParams {
         (best_bid, best_ask)
     }
 
+    fn get_min_max_price(
+        &self,
+        is_reducing: bool,
+        direction: Direction,
+        best_bid: &BigDecimal,
+        best_ask: &BigDecimal,
+        external_mid: &Option<BigDecimal>,
+        ticker: &InstrumentTicker,
+    ) -> (BigDecimal, BigDecimal) {
+        let mid = match external_mid {
+            Some(external_mid) => external_mid.clone(),
+            None => (best_bid + best_ask) / 2,
+        };
+        let min_edge = if is_reducing {
+            self.reducing_min_edge.clone()
+        } else {
+            self.increasing_min_edge.clone()
+        };
+        let spread_to_mid = &min_edge * &mid;
+
+        match direction {
+            Direction::Buy => (
+                ticker.min_price.clone(),
+                (best_ask - &ticker.tick_size).min(&mid - spread_to_mid),
+            ),
+            Direction::Sell => (
+                (best_bid + &ticker.tick_size).max(&mid + spread_to_mid),
+                ticker.max_price.clone(),
+            ),
+        }
+    }
+
     /// returns (price, amount, direction) to quote for the risk reducing level
     pub fn get_reducing_order(
         &self,
         orderbook: &OrderbookData,
+        external_orderbook: &Option<ExternalOrderbook>,
         balance: &BigDecimal,
         ticker: &InstrumentTicker,
     ) -> (BigDecimal, BigDecimal, Direction) {
         let zero = BigDecimal::zero();
-        let mark = &ticker.mark_price;
-        let exposure = balance * mark;
+        let external_mid = match external_orderbook {
+            Some(external_orderbook) => Some(external_orderbook.mid_price_with_basis()),
+            None => None,
+        };
+        let mark = match external_mid {
+            Some(ref external_mid) => external_mid.clone(),
+            None => ticker.mark_price.clone(),
+        };
+        let exposure = balance * &mark;
         let side = match balance >= &zero {
             true => Direction::Sell,
             false => Direction::Buy,
@@ -66,19 +108,14 @@ impl PerpMMParams {
         if amount < ticker.minimum_amount {
             return (BigDecimal::zero(), BigDecimal::zero(), side);
         }
-        let (best_bid, best_ask) = self.get_smooth_bbo(orderbook, mark);
-        let mid: BigDecimal = (&best_bid + &best_ask) / 2;
-
-        let spread_to_best = &self.min_spread_to_best * &mid;
-        let (min_price, max_price) = match side {
-            Direction::Buy => (ticker.min_price.clone(), &best_ask - spread_to_best),
-            Direction::Sell => (&best_bid + spread_to_best, ticker.max_price.clone()),
-        };
+        let (best_bid, best_ask) = self.get_smooth_bbo(orderbook, &mark);
+        let (min_price, max_price) =
+            self.get_min_max_price(true, side, &best_bid, &best_ask, &external_mid, ticker);
 
         // long means selling to reduce -> price down, short means buying to close -> price up
         let slippage = -&self.reducing_slippage * &exposure;
         // negative reducing_spread & buying -> price up, selling -> price down
-        let spread = -&self.reducing_spread * &mid * side.sign();
+        let spread = -&self.reducing_spread * &mark * side.sign();
         let rounding = match side {
             Direction::Buy => RoundingMode::Down,
             Direction::Sell => RoundingMode::Up,
@@ -149,18 +186,24 @@ impl PerpMMParams {
         amount: &BigDecimal,
         direction: &Direction,
         orderbook: &OrderbookData,
+        external_orderbook: &Option<ExternalOrderbook>,
         balance: &BigDecimal,
         ticker: &InstrumentTicker,
     ) -> BigDecimal {
         let zero = BigDecimal::zero();
-        let mark = &ticker.index_price;
-        let (best_bid, best_ask) = self.get_smooth_bbo(orderbook, mark);
-        let mid: BigDecimal = (&best_bid + &best_ask) / 2;
-        let spread_to_mid = &self.min_spread_to_mid * &mid;
-        let (min_price, max_price) = match direction {
-            Direction::Buy => (ticker.min_price.clone(), &mid - spread_to_mid),
-            Direction::Sell => (&mid + spread_to_mid, ticker.max_price.clone()),
+        let extern_mid = match external_orderbook {
+            Some(external_orderbook) => Some(external_orderbook.mid_price_with_basis()),
+            None => None,
         };
+        let mark = match extern_mid {
+            Some(ref external_mid) => external_mid.clone(),
+            None => ticker.mark_price.clone(),
+        };
+
+        let (best_bid, best_ask) = self.get_smooth_bbo(orderbook, &mark);
+
+        let (min_price, max_price) =
+            self.get_min_max_price(false, *direction, &best_bid, &best_ask, &extern_mid, ticker);
         let prev_levels_exposure =
             self.level_notionals.iter().take(level).sum::<BigDecimal>() * direction.sign();
         // assume there is an aggressive risk-reducing level that will get filled first
@@ -169,9 +212,9 @@ impl PerpMMParams {
             Direction::Sell => balance.min(&zero),
         };
         let exposure: BigDecimal =
-            (reduced_balance + amount * direction.sign() / 2) * mark + prev_levels_exposure;
+            (reduced_balance + amount * direction.sign() / 2) * &mark + prev_levels_exposure;
         let slippage = -&self.increasing_slippage * &exposure;
-        let spread = -&self.increasing_spread * &mid * direction.sign();
+        let spread = -&self.increasing_spread * &mark * direction.sign();
 
         let rounding = match direction {
             Direction::Buy => RoundingMode::Down,
@@ -193,11 +236,20 @@ impl PerpMMParams {
         direction: Direction,
         level: usize,
         orderbook: &OrderbookData,
+        external_orderbook: &Option<ExternalOrderbook>,
         balance: &BigDecimal,
         ticker: &InstrumentTicker,
     ) -> (BigDecimal, BigDecimal) {
         let amount = self.get_level_amount(level, &direction, balance, ticker);
-        let price = self.get_level_price(level, &amount, &direction, orderbook, balance, ticker);
+        let price = self.get_level_price(
+            level,
+            &amount,
+            &direction,
+            orderbook,
+            external_orderbook,
+            balance,
+            ticker,
+        );
         (price, amount)
     }
 }
@@ -331,7 +383,7 @@ impl OMS {
         desired_orders: &Vec<(bool, Direction, BigDecimal, BigDecimal)>,
     ) -> Result<i64> {
         let start = tokio::time::Instant::now();
-        OMS::log_desired(desired_orders);
+        // OMS::log_desired(desired_orders);
         let ticker = &state.ticker;
         let zero = BigDecimal::zero();
         let mut replaceable_orders: HashMap<i64, OMSOrder> = HashMap::from_iter(
@@ -475,11 +527,11 @@ pub struct PerpMM {
 /// temporary helper state to keep clones of market data during a cycle w/o locking the market
 #[derive(Clone, Debug)]
 struct PerpMMState {
-    pub subaccount_id: i64,
     pub price_tolerance: BigDecimal,
     pub amount_tolerance: BigDecimal,
     pub ticker: InstrumentTicker,
     pub orderbook: OrderbookData,
+    pub external_orderbook: Option<ExternalOrderbook>,
     pub balance: BigDecimal,
     pub open_orders: HashMap<i64, OpenOrderSummary>,
 }
@@ -526,25 +578,25 @@ impl PerpMM {
         }
     }
 
-    async fn run_market(&self) -> Result<()> {
-        let market = &self.market;
-        let params = self.params.read().await;
-        let instrument_name = params.instrument_name.clone();
-        let subaccount_id = params.subaccount_id;
-        drop(params);
-
-        let sync_instruments = vec![instrument_name.clone()];
-        sync_subaccount(market.clone(), subaccount_id, sync_instruments).await?;
+    /// Central task for syncing subaccount and instrument state
+    /// Can be ran as a single separate task that serves all market maker instances
+    pub async fn run_market(
+        market: MarketState,
+        subaccount_id: i64,
+        instrument_names: Vec<String>,
+    ) -> Result<()> {
+        /// TODO retry / reconnect logic here
+        sync_subaccount(market.clone(), subaccount_id, instrument_names.clone()).await?;
 
         let subacc_sub = subscribe_subaccount(market.clone(), subaccount_id);
-        let ticker_sub = subscribe_market(market.clone(), vec![&instrument_name]);
+        let ticker_sub = subscribe_market(market.clone(), instrument_names.clone());
 
         let res = tokio::select! {
             _ = ticker_sub => {Err(Error::msg("Market subscription exited early"))},
             _ = subacc_sub => {Err(Error::msg("Subaccount subscription exited early"))},
         };
 
-        tracing::warn!("LimitOrderAuction run_market finished with {:?}", res);
+        tracing::warn!("PerpMM run_market finished with {:?}", res);
         res
     }
 
@@ -557,8 +609,9 @@ impl PerpMM {
             let market = self.market.read().await;
             let ticker = market.get_ticker(&params.instrument_name);
             let ob = market.get_orderbook(&params.instrument_name);
+            let external_ob = market.get_external_orderbook(&params.instrument_name);
             let confirmed = market.all_trades_confirmed(&params.instrument_name);
-            if ticker.is_some() && ob.is_some() && confirmed {
+            if ticker.is_some() && ob.is_some() && external_ob.is_some() && confirmed {
                 return Ok(());
             }
         }
@@ -569,6 +622,22 @@ impl PerpMM {
         params.max_tps
     }
 
+    fn random_log_external_book(book: &Option<ExternalOrderbook>) {
+        if let Some(book) = book {
+            if book.recv_timestamp % 20 == 0 {
+                let basis = &book.basis;
+                let mid = book.mid_price();
+                let mid_with_basis = book.mid_price_with_basis();
+                tracing::info!(
+                    "External book: mid {} basis {} mid_with_basis {}",
+                    mid,
+                    basis,
+                    mid_with_basis
+                );
+            }
+        }
+    }
+
     pub async fn run_maker(&self) -> Result<()> {
         let max_tps = self.get_tps().await;
         self.market_ready().await?;
@@ -577,6 +646,7 @@ impl PerpMM {
         let mut last_publish_id = 0;
         let mut tps_left: i64 = max_tps as i64;
         let mut last_refill_us = chrono::Utc::now().timestamp_micros();
+        let mut last_external_book: Option<ExternalOrderbook> = None;
         loop {
             base_wait_time.tick().await;
 
@@ -595,12 +665,26 @@ impl PerpMM {
             let orderbook = market
                 .get_orderbook_exclude_my_orders(&params.instrument_name)
                 .ok_or(Error::msg("Orderbook not found"))?;
-
-            if orderbook.publish_id == last_publish_id {
+            let external_book = market
+                .get_external_orderbook(&params.instrument_name)
+                .map_or(None, |x| Some(x.clone()));
+            let is_external_different = match (&external_book, &last_external_book) {
+                (Some(external_book), Some(last_external_book)) => {
+                    external_book.is_different(last_external_book, &params.price_replace_tol)
+                }
+                _ => true,
+            };
+            if (orderbook.publish_id == last_publish_id) && !is_external_different {
                 continue;
             } else {
                 last_publish_id = orderbook.publish_id;
+                last_external_book = external_book.clone();
             }
+            if external_book.is_none() {
+                tracing::warn!("External book not found");
+            }
+
+            Self::random_log_external_book(&external_book);
 
             let ticker = market
                 .get_ticker(&params.instrument_name)
@@ -609,11 +693,11 @@ impl PerpMM {
 
             let state = {
                 PerpMMState {
-                    subaccount_id: params.subaccount_id,
                     price_tolerance: params.price_replace_tol.clone(),
                     amount_tolerance: params.amount_replace_tol.clone(),
                     ticker: ticker.clone(),
                     orderbook,
+                    external_orderbook: external_book,
                     balance,
                     open_orders: market.get_open_orders_summary(&params.instrument_name),
                 }
@@ -629,8 +713,12 @@ impl PerpMM {
                 continue;
             }
 
-            let (reduce_px, reduce_sz, reduce_dir) =
-                params.get_reducing_order(&state.orderbook, &state.balance, &state.ticker);
+            let (reduce_px, reduce_sz, reduce_dir) = params.get_reducing_order(
+                &state.orderbook,
+                &state.external_orderbook,
+                &state.balance,
+                &state.ticker,
+            );
             let mut desired_orders: Vec<(bool, Direction, BigDecimal, BigDecimal)> = vec![];
             let reduce_non_zero = reduce_sz > BigDecimal::zero();
             if reduce_non_zero {
@@ -641,6 +729,7 @@ impl PerpMM {
                     Direction::Buy,
                     i,
                     &state.orderbook,
+                    &state.external_orderbook,
                     &state.balance,
                     &state.ticker,
                 );
@@ -648,6 +737,7 @@ impl PerpMM {
                     Direction::Sell,
                     i,
                     &state.orderbook,
+                    &state.external_orderbook,
                     &state.balance,
                     &state.ticker,
                 );
@@ -668,7 +758,6 @@ impl PerpMM {
     }
 
     pub async fn run(self: Arc<Self>) -> Result<()> {
-        let run_market = self.run_market();
         let run_maker = self.run_maker();
         let client = {
             let oms = self.oms.lock().await;
@@ -677,7 +766,6 @@ impl PerpMM {
         let run_ping = client.ping_interval(15);
         let res = tokio::select! {
             _ = run_ping => {Err(Error::msg("Ping interval exited early"))},
-            _ = run_market => {Err(Error::msg("Market subscription exited early"))},
             r = run_maker => {
                 match r {
                     Ok(_) => tracing::error!("Maker exited early with status ok"),

@@ -2,13 +2,14 @@
   {
     "subaccount_id": 15301,
     "instrument_name": "ETH-PERP",
-    "increasing_spread": "-0.00006",
-    "increasing_slippage": "0.0006",
-    "reducing_spread": "-0.00006",
-    "reducing_slippage": "0.0006",
-    "max_spread_to_mid": "0.01",
-    "min_spread_to_mid": "0.00005",
-    "min_spread_to_best": "0.00002",
+    "external_symbol": "ETHUSD_PERP",
+    "increasing_spread": "-0.00003",
+    "increasing_slippage": "0.0003",
+    "increasing_min_edge": "0.0001",
+    "reducing_spread": "-0.00003",
+    "reducing_slippage": "0.0003",
+    "reducing_min_edge": "-0.00005",
+    "max_edge": "0.01",
     "warn_exposure": "2000",
     "max_exposure": "6000",
     "level_notionals": [
@@ -16,7 +17,7 @@
       "1500"
     ],
     "max_tps": 45,
-    "price_replace_tol": "0.00003",
+    "price_replace_tol": "0.00001",
     "amount_replace_tol": "0.05"
   }
 ]
