@@ -202,27 +202,36 @@ impl MarketData {
             None => true,
         }
     }
-    pub fn get_open_orders_summary(
+    pub fn get_open_orders_summary(&self, instrument_name: &str) -> HashMap<i64, OpenOrderSummary> {
+        let orders = self.get_orders(instrument_name);
+        if orders.is_none() {
+            return HashMap::new();
+        }
+        let orders = orders.unwrap();
+        let summary = HashMap::from_iter(
+            orders
+                .values()
+                .filter(|o| o.order_status == OrderStatus::Open)
+                .map(|o| (o.nonce, OpenOrderSummary::new_from_response(o))),
+        );
+        summary
+    }
+
+    pub fn get_direction_summary(
         &self,
         instrument_name: &str,
         direction: Direction,
-    ) -> Vec<(String, BigDecimal, BigDecimal)> {
+    ) -> Vec<OpenOrderSummary> {
         if let Some(orders) = self.get_orders(instrument_name) {
-            let mut summary: Vec<(String, BigDecimal, BigDecimal)> = orders
+            let mut summary: Vec<OpenOrderSummary> = orders
                 .values()
                 .filter(|o| o.direction == direction)
-                .map(|o| {
-                    (
-                        o.order_id.clone(),
-                        o.limit_price.clone(),
-                        o.amount.clone() - &o.filled_amount,
-                    )
-                })
+                .map(|o| OpenOrderSummary::new_from_response(o))
                 .collect();
             if direction == Direction::Buy {
-                summary.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                summary.sort_by(|a, b| b.limit_price.partial_cmp(&a.limit_price).unwrap());
             } else {
-                summary.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+                summary.sort_by(|a, b| a.limit_price.partial_cmp(&b.limit_price).unwrap());
             }
             summary
         } else {
@@ -256,6 +265,27 @@ impl MarketData {
             }
         }
         info!("-----------------------------------------------------------------------------");
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct OpenOrderSummary {
+    pub nonce: i64,
+    pub order_id: String,
+    pub direction: Direction,
+    pub limit_price: BigDecimal,
+    pub remain_amount: BigDecimal,
+}
+
+impl OpenOrderSummary {
+    pub fn new_from_response(order: &OrderResponse) -> Self {
+        OpenOrderSummary {
+            nonce: order.nonce,
+            order_id: order.order_id.clone(),
+            direction: order.direction,
+            limit_price: order.limit_price.clone(),
+            remain_amount: &order.amount - &order.filled_amount,
+        }
     }
 }
 

@@ -1,7 +1,7 @@
 [
   {
     "subaccount_id": 103808,
-    "instrument_name": "ETH-PERP",
+    "instrument_name": "BTC-PERP",
     "increasing_spread": "-0.00003",
     "increasing_slippage": "0.0003",
     "reducing_spread": "-0.00003",
@@ -12,8 +12,8 @@
     "warn_exposure": "2000",
     "max_exposure": "6000",
     "level_notionals": [
-      "500",
-      "1500"
+      "1000",
+      "2000"
     ],
     "max_tps": 40,
     "price_replace_tol": "0.00003",

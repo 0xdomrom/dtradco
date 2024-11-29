@@ -1,15 +1,19 @@
 use crate::maker::algos::perp_mm::{PerpMMParams, PerpMMParamsRef};
-use crate::maker::market::data::{new_market_state, MarketState, OrderbookData};
+use crate::maker::market::data::{new_market_state, MarketState, OpenOrderSummary, OrderbookData};
 use crate::maker::market::tasks::{subscribe_market, subscribe_subaccount, sync_subaccount};
 use anyhow::{Error, Result};
 use bigdecimal::{BigDecimal, One, RoundingMode, Zero};
 use lyra_client::actions::OrderArgs;
-use lyra_client::json_rpc::{WsClient, WsClientExt, WsClientState};
+use lyra_client::json_rpc::{Response, WsClient, WsClientExt, WsClientState};
+use orderbook_types::generated::private_cancel_by_instrument::PrivateCancelByInstrumentResponseSchema;
 use orderbook_types::types::orders::{Direction, OrderType, TimeInForce};
 use orderbook_types::types::tickers::InstrumentTicker;
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
+use tracing::Instrument;
 use uuid::Uuid;
 
 impl PerpMMParams {
@@ -198,6 +202,278 @@ impl PerpMMParams {
     }
 }
 
+/*
+order gets deleted from the state when the Market state no longer has it
+todo edge case: send -> instant cancel AND fail to cancel -> nothing in the state
+since send did not arrive yet -> order gets deleted -> order shows up in the state later
+we need to have an "error check" function that spots an open order in the Market
+for which there is no OMS order at all -> send cancel by instrument in that case
+*/
+
+#[derive(Clone, Debug)]
+enum OMSOrderState {
+    PendingSend,   // initialized as this
+    Open,          // updated to open when polled from market and seen as Open
+    PendingCancel, // updated to this when cancel is sent (no matter what the current state is)
+}
+
+#[derive(Clone, Debug)]
+struct OMSOrder {
+    nonce: i64,
+    order_id: Option<Uuid>,
+    label: String,
+    direction: Direction,
+    limit_price: BigDecimal,
+    remain_amount: BigDecimal,
+    state: OMSOrderState,
+    // if order is meant to be risk reducing
+    // when inserting a new reducing order we try to private/replace an existing reducing order
+    is_reducing: bool,
+    created_at: u64,
+}
+
+#[derive(Clone, Debug)]
+struct OMS {
+    subaccount_id: i64,
+    instrument_name: String,
+    client: WsClient,
+    orders: HashMap<i64, OMSOrder>,
+}
+
+impl OMS {
+    fn new(client: WsClient, subaccount_id: i64, instrument_name: String) -> Arc<Mutex<Self>> {
+        Arc::new(Mutex::new(OMS {
+            subaccount_id,
+            instrument_name,
+            client: client.clone(),
+            orders: HashMap::new(),
+        }))
+    }
+
+    pub async fn cancel_by_instrument(
+        &mut self,
+    ) -> Result<Response<PrivateCancelByInstrumentResponseSchema>> {
+        for (_, oms_order) in self.orders.iter_mut() {
+            oms_order.state = OMSOrderState::PendingCancel;
+        }
+        self.client
+            .cancel_by_instrument(self.subaccount_id, self.instrument_name.clone())
+            .await
+    }
+
+    pub fn sync_from_open(&mut self, open_orders: HashMap<i64, OpenOrderSummary>) -> Result<()> {
+        let mut nonces_to_remove: Vec<i64> = vec![];
+        for (nonce, oms_order) in self.orders.iter_mut() {
+            let open_order = open_orders.get(nonce);
+            match open_order {
+                Some(open_order) => {
+                    let new_state = match &oms_order.state {
+                        OMSOrderState::PendingSend => OMSOrderState::Open,
+                        OMSOrderState::PendingCancel => OMSOrderState::PendingCancel,
+                        OMSOrderState::Open => OMSOrderState::Open,
+                    };
+                    oms_order.state = new_state;
+                    oms_order.remain_amount = open_order.remain_amount.clone();
+                    oms_order.order_id = Some(Uuid::from_str(&open_order.order_id)?);
+                }
+                None => match oms_order.state {
+                    OMSOrderState::PendingSend => {}
+                    OMSOrderState::PendingCancel | OMSOrderState::Open => {
+                        nonces_to_remove.push(nonce.clone());
+                    }
+                },
+            }
+        }
+        for nonce in nonces_to_remove {
+            self.orders.remove(&nonce);
+        }
+        for nonce in open_orders.keys() {
+            let oms_order = self.orders.get(nonce);
+            if oms_order.is_none() {
+                return Err(Error::msg("Unexpected open order not present in OMS"));
+            }
+        }
+        Ok(())
+    }
+
+    fn insert_from_args(&mut self, nonce: i64, is_reducing: bool, order_args: &OrderArgs) -> i64 {
+        self.orders.insert(
+            nonce,
+            OMSOrder {
+                nonce,
+                order_id: None,
+                label: order_args.label.clone(),
+                direction: order_args.direction,
+                limit_price: order_args.limit_price.clone(),
+                remain_amount: order_args.amount.clone(),
+                state: OMSOrderState::PendingSend,
+                is_reducing,
+                created_at: chrono::Utc::now().timestamp_millis() as u64,
+            },
+        );
+        nonce
+    }
+    fn log_desired(desired_orders: &Vec<(bool, Direction, BigDecimal, BigDecimal)>) {
+        for (is_reduce, dir, price, amount) in desired_orders {
+            tracing::info!(
+                "Desired: {} {} {} {}",
+                if *is_reduce { "Reduce" } else { "Increase" },
+                dir,
+                price,
+                amount
+            );
+        }
+    }
+    /// TODO currently doing await when sending to socket, might be better to create tasks and join
+    pub async fn execute_desired(
+        &mut self,
+        state: &PerpMMState,
+        desired_orders: &Vec<(bool, Direction, BigDecimal, BigDecimal)>,
+    ) -> Result<i64> {
+        let start = tokio::time::Instant::now();
+        OMS::log_desired(desired_orders);
+        let ticker = &state.ticker;
+        let zero = BigDecimal::zero();
+        let mut replaceable_orders: HashMap<i64, OMSOrder> = HashMap::from_iter(
+            self.orders
+                .iter()
+                .filter(|(_, oms_order)| {
+                    matches!(
+                        oms_order.state,
+                        OMSOrderState::Open | OMSOrderState::PendingSend
+                    )
+                })
+                .map(|(nonce, oms_order)| (nonce.clone(), oms_order.clone())),
+        );
+        let mut rpc_ids: Vec<Uuid> = vec![];
+        for (is_reduce, dir, price, amount) in desired_orders {
+            if amount == &zero || price == &zero {
+                continue;
+            }
+
+            let order_args = OrderArgs {
+                amount: amount.clone(),
+                limit_price: price.clone(),
+                direction: dir.clone(),
+                time_in_force: TimeInForce::PostOnly,
+                order_type: OrderType::Limit,
+                label: format!("{}-{}", dir, price),
+                mmp: true,
+            };
+            // avoid using up tps if a very similar order is already sent or open
+            let similar_already_sent_or_open: Vec<i64> = replaceable_orders
+                .iter()
+                .filter(|(nonce, oms_order)| {
+                    oms_order.direction == *dir
+                        && oms_order.is_reducing == *is_reduce
+                        && (&oms_order.limit_price - price).abs() / price < state.price_tolerance
+                        && (&oms_order.remain_amount - amount).abs() / amount
+                            < state.amount_tolerance
+                })
+                .map(|(nonce, oms_order)| nonce.clone())
+                .collect();
+            if similar_already_sent_or_open.len() > 0 {
+                replaceable_orders.remove(&similar_already_sent_or_open[0]);
+                continue;
+            }
+            // otherwise take an order of the same direction and intention and replace it
+            let order_to_replace = replaceable_orders
+                .iter()
+                .find(|(_, oms_order)| {
+                    oms_order.direction == *dir && oms_order.is_reducing == *is_reduce
+                })
+                .map(|(nonce, o)| (nonce.clone(), o.state.clone()));
+
+            let mut new_sent = false;
+            if let Some((nonce_to_replace, state)) = order_to_replace {
+                replaceable_orders.remove(&nonce_to_replace);
+                let replaced = self.orders.get_mut(&nonce_to_replace).unwrap();
+                replaced.state = OMSOrderState::PendingCancel;
+
+                // order that is PendingSend cannot be safely replaced because if it fails,
+                // the replace call will start a fail chain (failed cancel fails a replace)
+                // so for this case we do manual cancel by nonce + insert later
+                match state {
+                    OMSOrderState::Open => {
+                        let (rpc_id, nonce) = self
+                            .client
+                            .send_replace_by_nonce_nowait(
+                                ticker,
+                                self.subaccount_id,
+                                nonce_to_replace.clone(),
+                                order_args.clone(),
+                            )
+                            .await?;
+                        self.insert_from_args(nonce, *is_reduce, &order_args);
+                        rpc_ids.push(rpc_id);
+                        new_sent = true;
+                    }
+                    OMSOrderState::PendingSend => {
+                        // send simple cancel by nonce
+                        let rpc_id = self
+                            .client
+                            .cancel_by_nonce_nowait(
+                                self.subaccount_id,
+                                self.instrument_name.clone(),
+                                nonce_to_replace.clone(),
+                            )
+                            .await?;
+                        rpc_ids.push(rpc_id);
+                    }
+                    OMSOrderState::PendingCancel => {
+                        return Err(Error::msg("Unexpected state PendingCancel"));
+                    }
+                };
+            };
+            // if state was PendingSend OR there was no order, we still need a regular send
+            if !new_sent {
+                let (rpc_id, nonce) = self
+                    .client
+                    .send_order_nowait(ticker, self.subaccount_id, order_args.clone())
+                    .await?;
+                self.insert_from_args(nonce, *is_reduce, &order_args);
+                rpc_ids.push(rpc_id)
+            }
+        }
+        // clean up any remaining replaceable orders
+        for (nonce, _) in replaceable_orders {
+            let cancelled = self.orders.get_mut(&nonce).unwrap();
+            cancelled.state = OMSOrderState::PendingCancel;
+
+            let rpc_id = self
+                .client
+                .cancel_by_nonce_nowait(
+                    self.subaccount_id,
+                    self.instrument_name.clone(),
+                    nonce.clone(),
+                )
+                .await?;
+            rpc_ids.push(rpc_id);
+        }
+
+        let num_rpc = rpc_ids.len();
+        let waiter_client = self.client.clone();
+        tokio::spawn(async move {
+            for rpc_id in rpc_ids {
+                let res = waiter_client.await_rpc(rpc_id).await;
+                tracing::info!("RPC {:?} finished", rpc_id);
+            }
+        });
+
+        let elapsed = start.elapsed();
+        tracing::info!("execute_desired took {} us", elapsed.as_micros());
+        Ok(num_rpc as i64)
+    }
+}
+
+pub struct PerpMM {
+    pub params: PerpMMParamsRef,
+    pub market: MarketState,
+    pub oms: Arc<Mutex<OMS>>,
+}
+
+/// temporary helper state to keep clones of market data during a cycle w/o locking the market
+#[derive(Clone, Debug)]
 struct PerpMMState {
     pub subaccount_id: i64,
     pub price_tolerance: BigDecimal,
@@ -205,26 +481,22 @@ struct PerpMMState {
     pub ticker: InstrumentTicker,
     pub orderbook: OrderbookData,
     pub balance: BigDecimal,
-    pub open_bids: Vec<(String, BigDecimal, BigDecimal)>,
-    pub open_asks: Vec<(String, BigDecimal, BigDecimal)>,
-}
-
-pub struct PerpMM {
-    pub params: PerpMMParamsRef,
-    pub market: MarketState,
-    pub client: WsClient,
+    pub open_orders: HashMap<i64, OpenOrderSummary>,
 }
 
 impl PerpMM {
     pub async fn new(params: PerpMMParamsRef) -> Result<Self> {
-        let market = new_market_state();
         let client = WsClient::new_client().await?;
         client.login().await?;
         client.enable_cancel_on_disconnect().await?;
+        let (subaccount_id, instrument_name) = {
+            let params = params.read().await;
+            (params.subaccount_id, params.instrument_name.clone())
+        };
         Ok(PerpMM {
             params,
-            market,
-            client,
+            market: new_market_state(),
+            oms: OMS::new(client, subaccount_id, instrument_name),
         })
     }
 
@@ -240,11 +512,17 @@ impl PerpMM {
         market
     }
 
-    pub fn new_from_state(params: PerpMMParamsRef, market: MarketState, client: WsClient) -> Self {
+    pub fn new_from_state(
+        params: PerpMMParamsRef,
+        market: MarketState,
+        client: WsClient,
+        subaccount_id: i64,
+        instrument_name: String,
+    ) -> Self {
         PerpMM {
             params,
             market,
-            client,
+            oms: OMS::new(client, subaccount_id, instrument_name),
         }
     }
 
@@ -286,92 +564,6 @@ impl PerpMM {
         }
     }
 
-    async fn execute_desired(
-        &self,
-        state: &PerpMMState,
-        direction: Direction,
-        quotes: &Vec<(BigDecimal, BigDecimal)>,
-        open_quotes: &Vec<(String, BigDecimal, BigDecimal)>,
-    ) -> Result<()> {
-        // first iterate open quotes and use replace endpoint if open limit price exceeds tol
-        // if some quotes are still left un-opened, use regular send_order endpoint
-        let subaccount_id = state.subaccount_id;
-        let ticker = &state.ticker;
-        let zero = BigDecimal::zero();
-        let mut send_tasks = vec![];
-        let mut replace_tasks = vec![];
-        let mut cancel_tasks = vec![];
-
-        if open_quotes.len() > quotes.len() {
-            tracing::warn!("Open quotes exceed desired quotes");
-            // cancel by instrument
-            self.client
-                .cancel_by_instrument(subaccount_id, ticker.instrument_name.clone())
-                .await?;
-            return Ok(());
-        }
-
-        for i in 0..open_quotes.len() {
-            let (desired_price, desired_amount) = &quotes[i];
-            let order_args = OrderArgs {
-                amount: desired_amount.clone(),
-                limit_price: desired_price.clone(),
-                direction,
-                time_in_force: TimeInForce::PostOnly,
-                order_type: OrderType::Limit,
-                label: format!("{}-{}", direction, i),
-                mmp: true,
-            };
-            let open_level = &open_quotes[i];
-            let open_id = Uuid::from_str(&open_level.0)?;
-            let open_price = &open_level.1;
-            let open_amount = &open_level.2;
-            if desired_amount == &zero {
-                let task =
-                    self.client
-                        .cancel(subaccount_id, ticker.instrument_name.clone(), open_id);
-                cancel_tasks.push(task);
-            } else {
-                let is_price_new = (open_price - desired_price).abs() > state.price_tolerance;
-                let is_amount_new = (open_amount - desired_amount).abs() > state.amount_tolerance;
-                if !is_price_new && !is_amount_new {
-                    continue;
-                }
-                let task = self
-                    .client
-                    .send_replace(ticker, subaccount_id, open_id, order_args);
-                replace_tasks.push(task);
-            }
-        }
-
-        // handle remaining quotes
-        for i in open_quotes.len()..quotes.len() {
-            let (desired_price, desired_amount) = &quotes[i];
-            let order_args = OrderArgs {
-                amount: desired_amount.clone(),
-                limit_price: desired_price.clone(),
-                direction,
-                time_in_force: TimeInForce::PostOnly,
-                order_type: OrderType::Limit,
-                label: format!("{}-{}", direction, i),
-                mmp: true,
-            };
-            if desired_amount == &zero {
-                continue;
-            }
-            let task = self.client.send_order(ticker, subaccount_id, order_args);
-            send_tasks.push(task);
-        }
-
-        let res = tokio::join! {
-            futures::future::join_all(send_tasks),
-            futures::future::join_all(replace_tasks),
-            futures::future::join_all(cancel_tasks),
-        };
-
-        Ok(())
-    }
-
     async fn get_tps(&self) -> u64 {
         let params = self.params.read().await;
         params.max_tps
@@ -381,7 +573,7 @@ impl PerpMM {
         let max_tps = self.get_tps().await;
         self.market_ready().await?;
 
-        let mut base_wait_time = tokio::time::interval(Duration::from_millis(1));
+        let mut base_wait_time = tokio::time::interval(Duration::from_micros(200));
         let mut last_publish_id = 0;
         let mut tps_left: i64 = max_tps as i64;
         let mut last_refill_us = chrono::Utc::now().timestamp_micros();
@@ -423,26 +615,26 @@ impl PerpMM {
                     ticker: ticker.clone(),
                     orderbook,
                     balance,
-                    open_bids: market
-                        .get_open_orders_summary(&params.instrument_name, Direction::Buy),
-                    open_asks: market
-                        .get_open_orders_summary(&params.instrument_name, Direction::Sell),
+                    open_orders: market.get_open_orders_summary(&params.instrument_name),
                 }
             };
             drop(market);
 
+            let mut oms = self.oms.lock().await;
+            let sync_res = oms.sync_from_open(state.open_orders.clone());
+            if sync_res.is_err() {
+                tracing::warn!("Failed to sync OMS state - cancelling all orders");
+                oms.cancel_by_instrument().await?;
+                tps_left -= 1;
+                continue;
+            }
+
             let (reduce_px, reduce_sz, reduce_dir) =
                 params.get_reducing_order(&state.orderbook, &state.balance, &state.ticker);
-            let (mut desired_bids, mut desired_asks) = (vec![], vec![]);
+            let mut desired_orders: Vec<(bool, Direction, BigDecimal, BigDecimal)> = vec![];
             let reduce_non_zero = reduce_sz > BigDecimal::zero();
-            match (reduce_dir, reduce_non_zero) {
-                (Direction::Buy, true) => {
-                    desired_bids.push((reduce_px, reduce_sz));
-                }
-                (Direction::Sell, true) => {
-                    desired_asks.push((reduce_px, reduce_sz));
-                }
-                _ => {}
+            if reduce_non_zero {
+                desired_orders.push((true, reduce_dir, reduce_px, reduce_sz));
             }
             for i in 0..params.level_notionals.len() {
                 let (bid_px, bid_sz) = params.get_increasing_order(
@@ -459,27 +651,18 @@ impl PerpMM {
                     &state.balance,
                     &state.ticker,
                 );
-                desired_bids.push((bid_px, bid_sz));
-                desired_asks.push((ask_px, ask_sz));
+                desired_orders.push((false, Direction::Buy, bid_px, bid_sz));
+                desired_orders.push((false, Direction::Sell, ask_px, ask_sz));
             }
-
             drop(params);
 
-            let bid_exec =
-                self.execute_desired(&state, Direction::Buy, &desired_bids, &state.open_bids);
-            let ask_exec =
-                self.execute_desired(&state, Direction::Sell, &desired_asks, &state.open_asks);
+            let num_rpc = oms.execute_desired(&state, &desired_orders).await?;
+            tps_left -= num_rpc;
 
-            let res = tokio::join!(bid_exec, ask_exec);
-
-            tps_left -= (desired_bids.len() + desired_asks.len() + 1) as i64;
             if tps_left <= 1 {
                 tracing::warn!("TPS limit reached, waiting for refill");
                 tps_left -= 1;
-                self.client
-                    .cancel_by_instrument(state.subaccount_id, state.ticker.instrument_name.clone())
-                    .await?
-                    .into_result()?;
+                oms.cancel_by_instrument().await?.into_result()?;
             }
         }
     }
@@ -487,7 +670,11 @@ impl PerpMM {
     pub async fn run(self: Arc<Self>) -> Result<()> {
         let run_market = self.run_market();
         let run_maker = self.run_maker();
-        let run_ping = self.client.ping_interval(15);
+        let client = {
+            let oms = self.oms.lock().await;
+            oms.client.clone()
+        };
+        let run_ping = client.ping_interval(15);
         let res = tokio::select! {
             _ = run_ping => {Err(Error::msg("Ping interval exited early"))},
             _ = run_market => {Err(Error::msg("Market subscription exited early"))},

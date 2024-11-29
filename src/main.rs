@@ -57,6 +57,10 @@ async fn main() -> Result<()> {
 
     let params = tokio::fs::read_to_string(format!("./params/{json_name}.json")).await?;
     let params: Vec<PerpMMParams> = serde_json::from_str(&params)?;
+    let subaccs_instruments = params
+        .iter()
+        .map(|p| (p.subaccount_id, p.instrument_name.clone()))
+        .collect::<Vec<(i64, String)>>();
 
     let params_refs = params
         .into_iter()
@@ -68,11 +72,15 @@ async fn main() -> Result<()> {
 
     let perp_mms: Vec<Arc<PerpMM>> = params_refs
         .into_iter()
-        .map(|params_ref| {
+        .enumerate()
+        .map(|(i, params_ref)| {
+            let (subacc, instr) = &subaccs_instruments[i];
             Arc::new(PerpMM::new_from_state(
                 params_ref,
                 market.clone(),
                 client.clone(),
+                subacc.clone(),
+                instr.clone(),
             ))
         })
         .collect();
